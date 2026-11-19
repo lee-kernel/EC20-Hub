@@ -1,0 +1,27 @@
+[package]
+name = "ec20-hub"
+version = "0.1.0"
+description = "Quectel EC20/EC25 4G Modem Manager for Windows"
+authors = ["EC20 Hub"]
+edition = "2021"
+
+[lib]
+name = "ec20_hub_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-notification = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serialport = "4.7"
+sysinfo = "0.33"
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1"
+tokio = { version = "1", features = ["sync", "time", "rt"] }
+
+[target.'cfg(windows)'.dependencies]
+tauri-winrt-notification = "0.8.1"
