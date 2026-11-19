@@ -674,8 +674,11 @@ pub fn run() {
             };
 
             app.manage(shared.clone());
-            if start_hidden {
-                if let Some(win) = app.get_webview_window("main") {
+            if let Some(win) = app.get_webview_window("main") {
+                if let Some(icon) = app.default_window_icon().cloned() {
+                    let _ = win.set_icon(icon);
+                }
+                if start_hidden {
                     let _ = win.hide();
                 }
             }
