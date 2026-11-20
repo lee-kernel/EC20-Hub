@@ -1,3 +1,4 @@
+mod driver;
 mod modem;
 mod network;
 mod pdu;
@@ -505,6 +506,11 @@ async fn set_usbnet_mode(
         if let Some(modem) = guard.as_mut() {
             modem.set_usbnet_mode(mode)?;
             *guard = None;
+            let removed_ndis = if mode == 2 {
+                driver::remove_conflicting_qcwwan_driver()
+            } else {
+                0
+            };
             let mode_name = match mode {
                 0 => "RMNET / QMI (0)",
                 1 => "ECM (1)",
@@ -523,12 +529,42 @@ async fn set_usbnet_mode(
                 build_dashboard(&snap)
             };
             let _ = app.emit("status-updated", payload);
-            Ok(format!(
-                "已将 USB 网卡模式设为 {mode_name} 并重启模块，约 15 秒后自动重连"
-            ))
+            if removed_ndis > 0 {
+                Ok(format!(
+                    "已将网卡模式设为 {mode_name}，自动清理了 {removed_ndis} 个冲突的移远 NDIS 驱动并重启模块"
+                ))
+            } else {
+                Ok(format!(
+                    "已将 USB 网卡模式设为 {mode_name} 并重启模块，约 15 秒后自动重连"
+                ))
+            }
         } else {
             Err("模块未连接".to_string())
         }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn install_serial_driver(
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    let st = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        let base_dir = app
+            .path()
+            .app_data_dir()
+            .unwrap_or_else(|_| std::env::temp_dir().join("ec20-hub"));
+        let msg = driver::install_quectel_serial_drivers(&base_dir)?;
+        poll_modem_once(&st, &app);
+        let payload = {
+            let snap = st.snapshot.read().unwrap();
+            build_dashboard(&snap)
+        };
+        let _ = app.emit("status-updated", payload);
+        Ok(msg)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -848,6 +884,7 @@ pub fn run() {
             refresh_now,
             reboot_modem,
             set_usbnet_mode,
+            install_serial_driver,
             update_settings,
             get_messages,
             mark_all_read,

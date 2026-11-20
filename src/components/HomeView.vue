@@ -13,7 +13,7 @@ const emit = defineEmits<{
 }>();
 
 const actionTip = ref<string | null>(null);
-const busyAction = ref<"" | "refresh" | "reboot" | "route" | "usbnet">("");
+const busyAction = ref<"" | "refresh" | "reboot" | "route" | "usbnet" | "driver">("");
 const adapters = ref<AdapterPriorityItem[]>([]);
 const priorityDirty = ref(false);
 const priorityAction = ref<"" | "load" | "apply">("");
@@ -146,6 +146,20 @@ async function handleSetUsbnet(mode: number) {
     busyAction.value = "";
   }
 }
+
+async function handleInstallDriver() {
+  if (busyAction.value) return;
+  busyAction.value = "driver";
+  showTip("正在安装内置移远 WHQL 串口驱动并清理冲突网卡驱动...");
+  try {
+    const res = await invoke<string>("install_serial_driver");
+    showTip(res);
+  } catch (e) {
+    showTip(String(e));
+  } finally {
+    busyAction.value = "";
+  }
+}
 </script>
 
 <template>
@@ -198,8 +212,19 @@ async function handleSetUsbnet(mode: number) {
         </button>
 
         <button
+          v-if="!dashboard.status.connected"
+          class="btn btn-primary"
+          :disabled="busyAction !== ''"
+          title="安装软件内置的移远 WHQL 串口驱动，并自动清理冲突的移远 NDIS 网卡驱动"
+          @click="handleInstallDriver"
+        >
+          {{ busyAction === "driver" ? "安装驱动中..." : "安装串口驱动" }}
+        </button>
+
+        <button
+          v-else
           class="btn"
-          :disabled="!dashboard.status.connected || busyAction !== ''"
+          :disabled="busyAction !== ''"
           @click="handleReboot"
         >
           {{ busyAction === "reboot" ? "重启中..." : "重启模块" }}

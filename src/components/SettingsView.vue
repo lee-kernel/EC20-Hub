@@ -14,6 +14,7 @@ const emit = defineEmits<{
 
 const autoStart = ref(false);
 const autoStartBusy = ref(false);
+const driverBusy = ref(false);
 const tip = ref<string | null>(null);
 
 const themeOptions: { value: ThemeMode; label: string; icon: typeof Sun }[] = [
@@ -54,6 +55,20 @@ async function handleToggleAutoStart() {
     showTip(String(e));
   } finally {
     autoStartBusy.value = false;
+  }
+}
+
+async function handleInstallDriver() {
+  if (driverBusy.value) return;
+  driverBusy.value = true;
+  showTip("正在安装内置移远 WHQL 串口驱动并清理冲突网卡驱动...");
+  try {
+    const res = await invoke<string>("install_serial_driver");
+    showTip(res);
+  } catch (e) {
+    showTip(String(e));
+  } finally {
+    driverBusy.value = false;
   }
 }
 
@@ -165,6 +180,23 @@ onMounted(async () => {
           />
           <span class="slider" />
         </label>
+      </div>
+    </div>
+
+    <!-- 驱动与免驱修复 -->
+    <div class="card">
+      <div class="card-title">驱动与硬件修复</div>
+
+      <div class="setting-row">
+        <div class="setting-info">
+          <div class="setting-name">内置移远 WHQL 串口驱动 &amp; 免驱网卡修复</div>
+          <div class="setting-desc">
+            一键安装内置的移远官方签名串口驱动（qcser.inf / qcfilter.inf / qcmdm.inf），并自动卸载会抢占 Windows 原生蜂窝网络的移远 NDIS 网卡驱动（qcwwan.inf）
+          </div>
+        </div>
+        <button class="btn btn-primary" :disabled="driverBusy" @click="handleInstallDriver">
+          {{ driverBusy ? "安装修复中..." : "一键安装 / 修复驱动" }}
+        </button>
       </div>
     </div>
   </div>
