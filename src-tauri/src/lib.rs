@@ -357,21 +357,81 @@ async fn set_autostart_enabled(enable: bool) -> Result<bool, String> {
     .map_err(|e| e.to_string())?
 }
 
+fn poll_modem_once(state: &AppState, app: &AppHandle) {
+    let mut guard = state.modem.lock().unwrap();
+
+    // Step 1: If already connected, try querying existing modem
+    let mut disconnected_err: Option<String> = None;
+    if let Some(modem) = guard.as_mut() {
+        let mut st = state.snapshot.read().unwrap().status.clone();
+        modem.drain_urcs();
+        match modem.query_status(&mut st) {
+            Ok(()) => {
+                sync_sms_with_modem(modem, state, app);
+                if modem.io_failed {
+                    disconnected_err = Some("串口连接已断开，正在重连...".to_string());
+                } else {
+                    let logs = modem.logs.clone();
+                    let mut snap = state.snapshot.write().unwrap();
+                    snap.status = st;
+                    snap.logs = logs;
+                    return;
+                }
+            }
+            Err(e) => {
+                disconnected_err = Some(e);
+            }
+        }
+    }
+
+    // If existing modem failed, drop it first so its OS serial handle is closed before scanning
+    if disconnected_err.is_some() {
+        *guard = None;
+    }
+
+    // Step 2: Try to detect and open the best Quectel AT port
+    let preferred = state.snapshot.read().unwrap().settings.preferred_port.clone();
+    let port_opt = modem::detect_best_port(preferred.as_deref());
+    if let Some(port) = port_opt {
+        match ModemClient::open(&port) {
+            Ok(mut client) => {
+                let mut st = ModemStatus::default();
+                if let Err(e) = client.query_status(&mut st) {
+                    let mut snap = state.snapshot.write().unwrap();
+                    snap.status.connected = false;
+                    snap.status.port_name = port;
+                    snap.status.error = Some(e);
+                } else {
+                    sync_sms_with_modem(&mut client, state, app);
+                    let logs = client.logs.clone();
+                    *guard = Some(client);
+                    let mut snap = state.snapshot.write().unwrap();
+                    snap.status = st;
+                    snap.logs = logs;
+                }
+            }
+            Err(e) => {
+                let mut snap = state.snapshot.write().unwrap();
+                snap.status.connected = false;
+                snap.status.port_name = port;
+                snap.status.error = Some(e);
+            }
+        }
+    } else {
+        let mut snap = state.snapshot.write().unwrap();
+        snap.status.connected = false;
+        snap.status.port_name.clear();
+        snap.status.error = Some(
+            disconnected_err.unwrap_or_else(|| "未检测到移远 AT 串口".to_string()),
+        );
+    }
+}
+
 #[tauri::command]
 async fn refresh_now(state: State<'_, AppState>, app: AppHandle) -> Result<DashboardPayload, String> {
     let st = state.inner().clone();
     tokio::task::spawn_blocking(move || {
-        let mut guard = st.modem.lock().unwrap();
-        if let Some(modem) = guard.as_mut() {
-            let mut status = st.snapshot.read().unwrap().status.clone();
-            modem.query_status(&mut status);
-            sync_sms_with_modem(modem, &st, &app);
-            let logs = modem.logs.clone();
-            let mut snap = st.snapshot.write().unwrap();
-            snap.status = status;
-            snap.logs = logs;
-        }
-        drop(guard);
+        poll_modem_once(&st, &app);
 
         let net = st.traffic.lock().unwrap().poll();
         let payload = {
@@ -391,16 +451,31 @@ async fn reboot_modem(state: State<'_, AppState>, app: AppHandle) -> Result<Stri
     let st = state.inner().clone();
     tokio::task::spawn_blocking(move || {
         let mut guard = st.modem.lock().unwrap();
+        if guard.is_none() {
+            let preferred = st.snapshot.read().unwrap().settings.preferred_port.clone();
+            if let Some(port) = modem::detect_best_port(preferred.as_deref()) {
+                if let Ok(client) = ModemClient::open(&port) {
+                    *guard = Some(client);
+                }
+            }
+        }
         if let Some(modem) = guard.as_mut() {
-            let _ = modem.send_at("AT+CFUN=1,1", 2000);
+            let res = modem.send_at("AT+CFUN=1,1", 2000);
             *guard = None;
             let payload = {
                 let mut snap = st.snapshot.write().unwrap();
                 snap.status.connected = false;
                 snap.status.reg_status = "正在重启...".to_string();
+                snap.status.error = Some("模块正在重启，请稍候...".to_string());
                 build_dashboard(&snap)
             };
             let _ = app.emit("status-updated", payload);
+            if let Err(e) = res {
+                // AT+CFUN=1,1 可能导致 USB 立即断开从而读取不到 OK，若不是写入前就断开则仍视为已下发
+                if e.contains("串口写入失败") || e.contains("串口连接已断开") {
+                    return Err(format!("重启指令发送失败（模块已断开）: {e}"));
+                }
+            }
             Ok("已发送重启指令，模块将在约 15 秒后自动重连".to_string())
         } else {
             Err("模块未连接".to_string())
@@ -422,7 +497,11 @@ async fn send_sms(
         {
             let mut guard = st.modem.lock().unwrap();
             let modem = guard.as_mut().ok_or_else(|| "模块未连接".to_string())?;
-            modem.send_pdu_sms(&recipient, &text)?;
+            let res = modem.send_pdu_sms(&recipient, &text);
+            if modem.io_failed {
+                *guard = None;
+            }
+            res?;
         }
 
         let msg = SmsMessage {
@@ -460,8 +539,16 @@ async fn clear_modem_storage(state: State<'_, AppState>, app: AppHandle) -> Resu
         let logs = {
             let mut guard = st.modem.lock().unwrap();
             let modem = guard.as_mut().ok_or_else(|| "模块未连接".to_string())?;
-            modem.clear_all_sms()?;
-            modem.query_status(&mut status);
+            let clear_res = modem.clear_all_sms();
+            if modem.io_failed {
+                *guard = None;
+                return Err("串口连接已断开，请等待模块自动重连后再试".to_string());
+            }
+            clear_res?;
+            if let Err(e) = modem.query_status(&mut status) {
+                *guard = None;
+                return Err(e);
+            }
             modem.logs.clone()
         };
         let payload = {
@@ -507,46 +594,7 @@ async fn apply_adapter_priorities(if_indices: Vec<u32>) -> Result<String, String
 
 fn spawn_background_worker(state: AppState, app: AppHandle) {
     std::thread::spawn(move || loop {
-        {
-            let mut guard = state.modem.lock().unwrap();
-            if guard.is_none() {
-                let preferred = state.snapshot.read().unwrap().settings.preferred_port.clone();
-                let port_opt = modem::detect_best_port(preferred.as_deref());
-                if let Some(port) = port_opt {
-                    match ModemClient::open(&port) {
-                        Ok(mut client) => {
-                            let mut st = ModemStatus::default();
-                            client.query_status(&mut st);
-                            sync_sms_with_modem(&mut client, &state, &app);
-                            let logs = client.logs.clone();
-                            *guard = Some(client);
-                            let mut snap = state.snapshot.write().unwrap();
-                            snap.status = st;
-                            snap.logs = logs;
-                        }
-                        Err(e) => {
-                            let mut snap = state.snapshot.write().unwrap();
-                            snap.status.connected = false;
-                            snap.status.port_name = port;
-                            snap.status.error = Some(e);
-                        }
-                    }
-                } else {
-                    let mut snap = state.snapshot.write().unwrap();
-                    snap.status.connected = false;
-                    snap.status.error = Some("未检测到移远 AT 串口".to_string());
-                }
-            } else if let Some(modem) = guard.as_mut() {
-                let mut st = state.snapshot.read().unwrap().status.clone();
-                modem.drain_urcs();
-                modem.query_status(&mut st);
-                sync_sms_with_modem(modem, &state, &app);
-                let logs = modem.logs.clone();
-                let mut snap = state.snapshot.write().unwrap();
-                snap.status = st;
-                snap.logs = logs;
-            }
-        }
+        poll_modem_once(&state, &app);
 
         let net = state.traffic.lock().unwrap().poll();
         let payload = {
@@ -652,10 +700,12 @@ fn setup_tray(app: &AppHandle, state: AppState) -> tauri::Result<()> {
                 let st = state.clone();
                 let ah = app_handle.clone();
                 std::thread::spawn(move || {
-                    let mut guard = st.modem.lock().unwrap();
-                    if let Some(modem) = guard.as_mut() {
-                        sync_sms_with_modem(modem, &st, &ah);
-                    }
+                    poll_modem_once(&st, &ah);
+                    let payload = {
+                        let snap = st.snapshot.read().unwrap();
+                        build_dashboard(&snap)
+                    };
+                    let _ = ah.emit("status-updated", payload);
                 });
             }
             "quit" => {

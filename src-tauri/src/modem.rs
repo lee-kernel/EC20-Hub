@@ -73,12 +73,20 @@ pub fn list_ports() -> Vec<PortInfo> {
 pub fn detect_best_port(preferred: Option<&str>) -> Option<String> {
     let ports = list_ports();
     if let Some(pref) = preferred {
-        if ports.iter().any(|p| p.port_name.eq_ignore_ascii_case(pref)) {
+        if ports
+            .iter()
+            .any(|p| p.port_name.eq_ignore_ascii_case(pref) && p.is_quectel_at)
+        {
             return Some(pref.to_string());
         }
     }
     if let Some(p) = ports.iter().find(|p| p.is_quectel_at) {
         return Some(p.port_name.clone());
+    }
+    if let Some(pref) = preferred {
+        if ports.iter().any(|p| p.port_name.eq_ignore_ascii_case(pref)) {
+            return Some(pref.to_string());
+        }
     }
     if let Some(p) = ports
         .iter()
@@ -94,6 +102,7 @@ pub struct ModemClient {
     port: Box<dyn SerialPort>,
     pub logs: Vec<String>,
     pub pending_cmti: Vec<u32>,
+    pub io_failed: bool,
 }
 
 impl ModemClient {
@@ -108,6 +117,7 @@ impl ModemClient {
             port,
             logs: Vec::new(),
             pending_cmti: Vec::new(),
+            io_failed: false,
         };
         client.initialize()?;
         Ok(client)
@@ -133,7 +143,7 @@ impl ModemClient {
     }
 
     pub fn initialize(&mut self) -> Result<(), String> {
-        let _ = self.send_at("ATE0", 1000);
+        self.send_at("ATE0", 1000)?;
         let _ = self.send_at("AT+CMEE=2", 1000);
         let _ = self.send_at("AT+CMGF=0", 1000);
         let _ = self.send_at("AT+CPMS=\"SM\",\"SM\",\"SM\"", 1000);
@@ -142,13 +152,23 @@ impl ModemClient {
     }
 
     pub fn drain_urcs(&mut self) {
+        if self.io_failed {
+            return;
+        }
         let mut buf = [0u8; 1024];
         let mut collected = String::new();
-        while let Ok(n) = self.port.read(&mut buf) {
-            if n == 0 {
-                break;
+        loop {
+            match self.port.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    collected.push_str(&String::from_utf8_lossy(&buf[..n]));
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => break,
+                Err(_) => {
+                    self.io_failed = true;
+                    break;
+                }
             }
-            collected.push_str(&String::from_utf8_lossy(&buf[..n]));
         }
         if !collected.is_empty() {
             for line in collected.lines() {
@@ -162,13 +182,20 @@ impl ModemClient {
     }
 
     pub fn send_at(&mut self, cmd: &str, timeout_ms: u64) -> Result<Vec<String>, String> {
+        if self.io_failed {
+            return Err("串口连接已断开".to_string());
+        }
         self.drain_urcs();
+        if self.io_failed {
+            return Err("串口连接已断开".to_string());
+        }
         self.push_log(&format!(">> {cmd}"));
 
         let payload = format!("{cmd}\r\n");
-        self.port
-            .write_all(payload.as_bytes())
-            .map_err(|e| format!("串口写入失败: {e}"))?;
+        if let Err(e) = self.port.write_all(payload.as_bytes()) {
+            self.io_failed = true;
+            return Err(format!("串口写入失败: {e}"));
+        }
         let _ = self.port.flush();
 
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
@@ -202,7 +229,10 @@ impl ModemClient {
                 }
                 Ok(_) => {}
                 Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
-                Err(e) => return Err(format!("串口读取失败: {e}")),
+                Err(e) => {
+                    self.io_failed = true;
+                    return Err(format!("串口读取失败: {e}"));
+                }
             }
         }
 
@@ -216,11 +246,15 @@ impl ModemClient {
     pub fn send_pdu_sms(&mut self, recipient: &str, text: &str) -> Result<(), String> {
         let (tpdu_len, pdu_hex) = pdu::encode_ucs2_submit_pdu(recipient, text)?;
         self.drain_urcs();
+        if self.io_failed {
+            return Err("串口连接已断开".to_string());
+        }
         let cmd = format!("AT+CMGS={tpdu_len}\r\n");
         self.push_log(&format!(">> AT+CMGS={tpdu_len}"));
-        self.port
-            .write_all(cmd.as_bytes())
-            .map_err(|e| e.to_string())?;
+        if let Err(e) = self.port.write_all(cmd.as_bytes()) {
+            self.io_failed = true;
+            return Err(format!("串口写入失败: {e}"));
+        }
         let _ = self.port.flush();
 
         // Wait for '>' prompt
@@ -229,13 +263,19 @@ impl ModemClient {
         let mut buf = [0u8; 256];
         let mut got_prompt = false;
         while Instant::now() < deadline {
-            if let Ok(n) = self.port.read(&mut buf) {
-                if n > 0 {
+            match self.port.read(&mut buf) {
+                Ok(n) if n > 0 => {
                     raw.push_str(&String::from_utf8_lossy(&buf[..n]));
                     if raw.contains('>') {
                         got_prompt = true;
                         break;
                     }
+                }
+                Ok(_) => {}
+                Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(e) => {
+                    self.io_failed = true;
+                    return Err(format!("串口读取失败: {e}"));
                 }
             }
         }
@@ -246,16 +286,17 @@ impl ModemClient {
 
         let body = format!("{pdu_hex}\x1A");
         self.push_log(&format!(">> [PDU {} bytes] <Ctrl+Z>", pdu_hex.len() / 2));
-        self.port
-            .write_all(body.as_bytes())
-            .map_err(|e| e.to_string())?;
+        if let Err(e) = self.port.write_all(body.as_bytes()) {
+            self.io_failed = true;
+            return Err(format!("串口写入失败: {e}"));
+        }
         let _ = self.port.flush();
 
         let send_deadline = Instant::now() + Duration::from_secs(15);
         raw.clear();
         while Instant::now() < send_deadline {
-            if let Ok(n) = self.port.read(&mut buf) {
-                if n > 0 {
+            match self.port.read(&mut buf) {
+                Ok(n) if n > 0 => {
                     raw.push_str(&String::from_utf8_lossy(&buf[..n]));
                     if raw.contains("\nOK") || raw.trim().ends_with("OK") {
                         self.push_log("<< OK (短信已发送)");
@@ -265,6 +306,12 @@ impl ModemClient {
                         self.push_log(&format!("<< {}", raw.trim()));
                         return Err(raw.trim().to_string());
                     }
+                }
+                Ok(_) => {}
+                Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(e) => {
+                    self.io_failed = true;
+                    return Err(format!("串口读取失败: {e}"));
                 }
             }
         }
@@ -304,13 +351,21 @@ impl ModemClient {
         (imei, firmware, iccid, imsi)
     }
 
-    pub fn query_status(&mut self, cached: &mut ModemStatus) {
+    pub fn query_status(&mut self, cached: &mut ModemStatus) -> Result<(), String> {
+        self.send_at("AT", 1000)?;
+        if self.io_failed {
+            return Err("串口连接已断开".to_string());
+        }
+
         cached.connected = true;
         cached.port_name = self.port_name.clone();
         cached.error = None;
 
         if cached.imei.is_empty() || cached.iccid.is_empty() {
             let (imei, fw, iccid, imsi) = self.query_device_info();
+            if self.io_failed {
+                return Err("串口连接已断开".to_string());
+            }
             if !imei.is_empty() {
                 cached.imei = imei;
             }
@@ -328,6 +383,8 @@ impl ModemClient {
         // SIM status
         if let Ok(lines) = self.send_at("AT+CPIN?", 1000) {
             cached.sim_inserted = lines.iter().any(|l| l.contains("READY"));
+        } else if self.io_failed {
+            return Err("串口连接已断开".to_string());
         } else {
             cached.sim_inserted = false;
         }
@@ -445,8 +502,12 @@ impl ModemClient {
 
         // Restore default SM
         let _ = self.send_at("AT+CPMS=\"SM\",\"SM\",\"SM\"", 1000);
+        if self.io_failed {
+            return Err("串口连接已断开".to_string());
+        }
 
         cached.last_updated = chrono::Local::now().format("%H:%M:%S").to_string();
+        Ok(())
     }
 
     pub fn read_all_pdu_from(&mut self, storage: &str) -> Vec<(u32, DecodedPdu)> {

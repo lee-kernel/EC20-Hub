@@ -66,10 +66,19 @@ async function loadMessages() {
   messages.value = await invoke<SmsMessage[]>("get_messages");
 }
 
-async function refreshNow() {
-  dashboard.value = await invoke<DashboardPayload>("refresh_now");
-  applyTheme(dashboard.value.settings.theme);
-  await loadMessages();
+async function refreshNow(done?: (ok: boolean, msg: string) => void) {
+  try {
+    dashboard.value = await invoke<DashboardPayload>("refresh_now");
+    applyTheme(dashboard.value.settings.theme);
+    await loadMessages();
+    if (dashboard.value.status.connected) {
+      done?.(true, `已同步模块 (${dashboard.value.status.portName})`);
+    } else {
+      done?.(false, dashboard.value.status.error || "模块未连接");
+    }
+  } catch (e) {
+    done?.(false, `刷新失败: ${e}`);
+  }
 }
 
 async function updateSettings(next: AppSettings) {

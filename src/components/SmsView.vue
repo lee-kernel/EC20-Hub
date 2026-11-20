@@ -12,7 +12,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (e: "reload-messages"): void;
-  (e: "refresh"): void;
+  (e: "refresh", done?: (ok: boolean, msg: string) => void): void;
   (e: "mark-read"): void;
 }>();
 
@@ -117,14 +117,11 @@ async function copyText(text: string, label: string) {
 async function handleSync() {
   if (syncing.value) return;
   syncing.value = true;
-  try {
-    emit("refresh");
-    showTip("已触发模块同步");
-  } finally {
-    setTimeout(() => {
-      syncing.value = false;
-    }, 600);
-  }
+  showTip("正在同步模块短信...");
+  emit("refresh", (_ok, msg) => {
+    syncing.value = false;
+    showTip(msg);
+  });
 }
 
 async function handleSend() {

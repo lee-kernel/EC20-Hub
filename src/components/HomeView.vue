@@ -9,7 +9,7 @@ defineProps<{
 }>();
 
 const emit = defineEmits<{
-  (e: "refresh"): void;
+  (e: "refresh", done?: (ok: boolean, msg: string) => void): void;
 }>();
 
 const actionTip = ref<string | null>(null);
@@ -88,11 +88,11 @@ function showTip(msg: string) {
 function handleRefresh() {
   if (busyAction.value) return;
   busyAction.value = "refresh";
-  emit("refresh");
   showTip("正在刷新模块状态...");
-  setTimeout(() => {
-    if (busyAction.value === "refresh") busyAction.value = "";
-  }, 600);
+  emit("refresh", (_ok, msg) => {
+    busyAction.value = "";
+    showTip(msg);
+  });
 }
 
 async function handleReboot() {
