@@ -11,6 +11,7 @@ export interface ModemStatus {
   firmware: string;
   iccid: string;
   imsi: string;
+  usbnetMode: number | null;
   simSmsUsed: number;
   simSmsTotal: number;
   meSmsUsed: number;

@@ -325,14 +325,30 @@ pub fn set_adapter_enabled(enable: bool) -> Result<String, String> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AdapterPriorityItem {
+    #[serde(default)]
     pub if_index: u32,
+    #[serde(default, deserialize_with = "de_null_string")]
     pub name: String,
+    #[serde(default, deserialize_with = "de_null_string")]
     pub description: String,
+    #[serde(default, deserialize_with = "de_null_string")]
     pub status: String,
+    #[serde(default)]
     pub metric: u32,
+    #[serde(default)]
     pub is_modem: bool,
+    #[serde(default)]
     pub is_default_route: bool,
+    #[serde(default, deserialize_with = "de_null_string")]
     pub tag: String,
+}
+
+fn de_null_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<String>::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
 }
 
 pub fn list_adapter_priorities() -> Result<Vec<AdapterPriorityItem>, String> {
@@ -354,8 +370,9 @@ $items = Get-NetAdapter -ErrorAction SilentlyContinue |
   Where-Object { $_.Status -ne 'Not Present' -and $_.Name -notmatch 'Loopback' } |
   ForEach-Object {
     $idx = [int]$_.ifIndex
-    $desc = [string]$_.InterfaceDescription
-    $name = [string]$_.Name
+    $desc = if ($null -ne $_.InterfaceDescription) { [string]$_.InterfaceDescription } else { '' }
+    $name = if ($null -ne $_.Name) { [string]$_.Name } else { "接口 $idx" }
+    $stat = if ($null -ne $_.Status) { [string]$_.Status } else { 'Unknown' }
     $metric = if ($ipMap.ContainsKey($idx)) { $ipMap[$idx] } else { 9999 }
     $isModem = ($desc -match 'Quectel|RMNET|MBIM|Generic Mobile Broadband|通用移动宽带|LTE Module' -or $name -match '蜂窝|Cellular')
     $tag = if ($isModem) {
@@ -371,7 +388,7 @@ $items = Get-NetAdapter -ErrorAction SilentlyContinue |
       ifIndex = $idx
       name = $name
       description = $desc
-      status = [string]$_.Status
+      status = $stat
       metric = $metric
       isModem = $isModem
       isDefaultRoute = ($idx -eq $defIdx)

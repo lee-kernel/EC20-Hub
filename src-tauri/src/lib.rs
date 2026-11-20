@@ -486,6 +486,55 @@ async fn reboot_modem(state: State<'_, AppState>, app: AppHandle) -> Result<Stri
 }
 
 #[tauri::command]
+async fn set_usbnet_mode(
+    mode: u8,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    let st = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        let mut guard = st.modem.lock().unwrap();
+        if guard.is_none() {
+            let preferred = st.snapshot.read().unwrap().settings.preferred_port.clone();
+            if let Some(port) = modem::detect_best_port(preferred.as_deref()) {
+                if let Ok(client) = ModemClient::open(&port) {
+                    *guard = Some(client);
+                }
+            }
+        }
+        if let Some(modem) = guard.as_mut() {
+            modem.set_usbnet_mode(mode)?;
+            *guard = None;
+            let mode_name = match mode {
+                0 => "RMNET / QMI (0)",
+                1 => "ECM (1)",
+                2 => "MBIM (2, Windows 免驱蜂窝网络)",
+                3 => "RNDIS (3)",
+                _ => "自定义",
+            };
+            let payload = {
+                let mut snap = st.snapshot.write().unwrap();
+                snap.status.connected = false;
+                snap.status.usbnet_mode = Some(mode);
+                snap.status.reg_status = "正在切换网卡模式并重启...".to_string();
+                snap.status.error = Some(format!(
+                    "已切换为 {mode_name}，模块正在重启..."
+                ));
+                build_dashboard(&snap)
+            };
+            let _ = app.emit("status-updated", payload);
+            Ok(format!(
+                "已将 USB 网卡模式设为 {mode_name} 并重启模块，约 15 秒后自动重连"
+            ))
+        } else {
+            Err("模块未连接".to_string())
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 async fn send_sms(
     recipient: String,
     text: String,
@@ -798,6 +847,7 @@ pub fn run() {
             open_sms_window,
             refresh_now,
             reboot_modem,
+            set_usbnet_mode,
             update_settings,
             get_messages,
             mark_all_read,

@@ -13,7 +13,7 @@ const emit = defineEmits<{
 }>();
 
 const actionTip = ref<string | null>(null);
-const busyAction = ref<"" | "refresh" | "reboot" | "route">("");
+const busyAction = ref<"" | "refresh" | "reboot" | "route" | "usbnet">("");
 const adapters = ref<AdapterPriorityItem[]>([]);
 const priorityDirty = ref(false);
 const priorityAction = ref<"" | "load" | "apply">("");
@@ -118,6 +118,34 @@ async function handleCheckRoute() {
     busyAction.value = "";
   }
 }
+
+function formatUsbnetMode(mode: number | null): string {
+  switch (mode) {
+    case 0:
+      return "RMNET / QMI (0)";
+    case 1:
+      return "ECM (1)";
+    case 2:
+      return "MBIM (2 · Win 免驱蜂窝)";
+    case 3:
+      return "RNDIS (3)";
+    default:
+      return "--";
+  }
+}
+
+async function handleSetUsbnet(mode: number) {
+  if (busyAction.value) return;
+  busyAction.value = "usbnet";
+  try {
+    const res = await invoke<string>("set_usbnet_mode", { mode });
+    showTip(res);
+  } catch (e) {
+    showTip(String(e));
+  } finally {
+    busyAction.value = "";
+  }
+}
 </script>
 
 <template>
@@ -206,8 +234,28 @@ async function handleCheckRoute() {
           <span class="info-value">{{ dashboard.status.portName || "自动检测中" }}</span>
         </div>
         <div class="info-row">
-          <span class="info-label">模块型号</span>
-          <span class="info-value">Quectel EC20 / EC25 (VID 2C7C)</span>
+          <span class="info-label">网卡模式</span>
+          <span class="info-value usbnet-cell">
+            <span>{{ formatUsbnetMode(dashboard.status.usbnetMode) }}</span>
+            <button
+              v-if="dashboard.status.connected && dashboard.status.usbnetMode !== null && dashboard.status.usbnetMode !== 2"
+              class="btn btn-xs btn-primary"
+              :disabled="busyAction !== ''"
+              title="切换为 MBIM (2) 以匹配 Windows 自带蜂窝网络驱动，避免 Code 43"
+              @click="handleSetUsbnet(2)"
+            >
+              {{ busyAction === "usbnet" ? "切换中..." : "对齐 MBIM" }}
+            </button>
+            <button
+              v-else-if="dashboard.status.connected && dashboard.status.usbnetMode === 2"
+              class="btn btn-xs"
+              :disabled="busyAction !== ''"
+              title="切回移远 RMNET (0) 模式（需安装移远 NDIS 驱动）"
+              @click="handleSetUsbnet(0)"
+            >
+              切回 RMNET
+            </button>
+          </span>
         </div>
       </div>
     </div>
@@ -467,6 +515,18 @@ async function handleCheckRoute() {
 
 .selectable {
   user-select: text;
+}
+
+.usbnet-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.btn-xs {
+  padding: 2px 7px;
+  font-size: 11px;
+  border-radius: 5px;
 }
 
 .adapter-name {

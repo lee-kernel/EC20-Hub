@@ -27,6 +27,7 @@ const dashboard = ref<DashboardPayload>({
     firmware: "",
     iccid: "",
     imsi: "",
+    usbnetMode: null,
     simSmsUsed: 0,
     simSmsTotal: 0,
     meSmsUsed: 0,

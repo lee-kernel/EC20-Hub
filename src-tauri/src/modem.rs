@@ -27,6 +27,7 @@ pub struct ModemStatus {
     pub firmware: String,
     pub iccid: String,
     pub imsi: String,
+    pub usbnet_mode: Option<u8>,
     pub sim_sms_used: u32,
     pub sim_sms_total: u32,
     pub me_sms_used: u32,
@@ -351,6 +352,30 @@ impl ModemClient {
         (imei, firmware, iccid, imsi)
     }
 
+    pub fn query_usbnet_mode(&mut self) -> Option<u8> {
+        let lines = self.send_at("AT+QCFG=\"usbnet\"", 1000).ok()?;
+        for line in lines {
+            if line.to_uppercase().contains("USBNET") {
+                if let Some((_, mode_str)) = line.rsplit_once(',') {
+                    let clean = mode_str.trim().trim_matches('"');
+                    if let Ok(m) = clean.parse::<u8>() {
+                        return Some(m);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub fn set_usbnet_mode(&mut self, mode: u8) -> Result<(), String> {
+        if mode > 3 {
+            return Err("不支持的 usbnet 模式（仅支持 0/1/2/3）".to_string());
+        }
+        self.send_at(&format!("AT+QCFG=\"usbnet\",{mode}"), 2000)?;
+        let _ = self.send_at("AT+CFUN=1,1", 2000);
+        Ok(())
+    }
+
     pub fn query_status(&mut self, cached: &mut ModemStatus) -> Result<(), String> {
         self.send_at("AT", 1000)?;
         if self.io_failed {
@@ -378,6 +403,10 @@ impl ModemClient {
             if !imsi.is_empty() {
                 cached.imsi = imsi;
             }
+        }
+
+        if cached.usbnet_mode.is_none() {
+            cached.usbnet_mode = self.query_usbnet_mode();
         }
 
         // SIM status
