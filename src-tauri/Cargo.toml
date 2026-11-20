@@ -1,6 +1,6 @@
 [package]
 name = "ec20-hub"
-version = "0.1.0"
+version = "0.1.1"
 description = "Quectel EC20/EC25 4G Modem Manager for Windows"
 authors = ["EC20 Hub"]
 edition = "2021"

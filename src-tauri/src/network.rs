@@ -87,7 +87,16 @@ fn run_powershell(script: &str, envs: &[(&str, &str)]) -> Result<PsOutput, Strin
 }
 
 fn find_quectel_adapter_via_dotnet() -> Option<ResolvedAdapter> {
-    let script = "[System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() | Where-Object { $_.Description -match 'Quectel|RMNET|MBIM' } | Select-Object -First 1 | ForEach-Object { \"$($_.Name)|$($_.Description)\" }";
+    let script = r#"
+[System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() |
+  Where-Object {
+    $_.Description -match 'Quectel|RMNET|MBIM|Generic Mobile Broadband|通用移动宽带|LTE Module' -or
+    $_.NetworkInterfaceType -match 'Wwan'
+  } |
+  Sort-Object { if ($_.OperationalStatus -eq 'Up') { 0 } else { 1 } } |
+  Select-Object -First 1 |
+  ForEach-Object { "$($_.Name)|$($_.Description)" }
+"#;
     let out = run_powershell(script, &[]).ok()?;
     let text = out.stdout;
     let (name, desc) = text.split_once('|')?;
@@ -104,8 +113,13 @@ pub struct TrafficTracker {
     networks: Networks,
     resolved: Option<ResolvedAdapter>,
     last_resolve: Option<Instant>,
+    matched_adapter: Option<String>,
     baseline_rx: Option<u64>,
     baseline_tx: Option<u64>,
+    last_rx: u64,
+    last_tx: u64,
+    carried_rx: u64,
+    carried_tx: u64,
 }
 
 /// 未找到网卡时，重新探测的最小间隔（PowerShell 启动较慢，避免每次轮询都调用）
@@ -118,8 +132,13 @@ impl TrafficTracker {
             networks: Networks::new_with_refreshed_list(),
             resolved: None,
             last_resolve: None,
+            matched_adapter: None,
             baseline_rx: None,
             baseline_tx: None,
+            last_rx: 0,
+            last_tx: 0,
+            carried_rx: 0,
+            carried_tx: 0,
         }
     }
 
@@ -142,36 +161,90 @@ impl TrafficTracker {
         let mut total_rx = 0u64;
         let mut total_tx = 0u64;
         let mut found = false;
+        let mut current_name: Option<String> = None;
 
-        for (name, data) in &self.networks {
-            let is_match = if let Some(ref res) = self.resolved {
-                name.eq_ignore_ascii_case(&res.friendly_name)
-            } else {
-                let lower = name.to_lowercase();
-                lower.contains("quectel")
-                    || lower.contains("蜂窝")
-                    || lower.contains("cellular")
-                    || lower.contains("rmnet")
-            };
-
-            if is_match {
-                if self.resolved.is_none() {
-                    matched_label = name.clone();
-                }
+        // 优先精确匹配已解析的网卡名称
+        if let Some(ref res) = self.resolved {
+            if let Some((name, data)) = self
+                .networks
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(&res.friendly_name))
+            {
                 total_rx = data.total_received();
                 total_tx = data.total_transmitted();
+                current_name = Some(name.clone());
                 found = true;
-                break;
+            } else {
+                // 原网卡已掉线或改名（如切驱动/换 USB 口后变为 蜂窝网络 5），清空缓存以便重新探测
+                self.resolved = None;
             }
         }
 
-        if found && self.baseline_rx.is_none() {
-            self.baseline_rx = Some(total_rx);
-            self.baseline_tx = Some(total_tx);
+        // 若未命中，再按名称回退匹配（过滤掉 Windows WFP/QoS 等轻量级筛选器伪接口）
+        if !found {
+            for (name, data) in &self.networks {
+                let lower = name.to_lowercase();
+                if lower.contains("lightweight filter")
+                    || lower.contains("packet scheduler")
+                    || lower.contains("-wfp ")
+                {
+                    continue;
+                }
+                if lower.contains("quectel")
+                    || lower.contains("蜂窝")
+                    || lower.contains("cellular")
+                    || lower.contains("rmnet")
+                {
+                    matched_label = name.clone();
+                    total_rx = data.total_received();
+                    total_tx = data.total_transmitted();
+                    current_name = Some(name.clone());
+                    found = true;
+                    break;
+                }
+            }
         }
 
-        let session_rx = total_rx.saturating_sub(self.baseline_rx.unwrap_or(total_rx));
-        let session_tx = total_tx.saturating_sub(self.baseline_tx.unwrap_or(total_tx));
+        if found {
+            let adapter_changed = match (&self.matched_adapter, &current_name) {
+                (Some(prev), Some(curr)) => !prev.eq_ignore_ascii_case(curr),
+                _ => false,
+            };
+
+            if self.baseline_rx.is_none() {
+                self.baseline_rx = Some(total_rx);
+                self.baseline_tx = Some(total_tx);
+            } else {
+                // 如果模块重启、重连、切驱动或换了网卡导致系统累计字节计数器归零/回退，
+                // 先把上一段会话已产生的增量累加到 carried_*，再将基线重置为当前值，
+                // 避免 total_rx < baseline_rx 时 saturating_sub 恒为 0。
+                if adapter_changed || total_rx < self.last_rx {
+                    let prev_base = self.baseline_rx.unwrap_or(self.last_rx);
+                    self.carried_rx = self
+                        .carried_rx
+                        .saturating_add(self.last_rx.saturating_sub(prev_base));
+                    self.baseline_rx = Some(total_rx);
+                }
+                if adapter_changed || total_tx < self.last_tx {
+                    let prev_base = self.baseline_tx.unwrap_or(self.last_tx);
+                    self.carried_tx = self
+                        .carried_tx
+                        .saturating_add(self.last_tx.saturating_sub(prev_base));
+                    self.baseline_tx = Some(total_tx);
+                }
+            }
+
+            self.matched_adapter = current_name;
+            self.last_rx = total_rx;
+            self.last_tx = total_tx;
+        }
+
+        let session_rx = self
+            .carried_rx
+            .saturating_add(total_rx.saturating_sub(self.baseline_rx.unwrap_or(total_rx)));
+        let session_tx = self
+            .carried_tx
+            .saturating_add(total_tx.saturating_sub(self.baseline_tx.unwrap_or(total_tx)));
 
         NetworkStats {
             adapter_name: matched_label,
@@ -186,12 +259,18 @@ impl TrafficTracker {
 
 pub fn check_4g_route() -> Result<String, String> {
     let script = r#"
-$n = [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() | Where-Object { $_.Description -match 'Quectel|RMNET|MBIM' } | Select-Object -First 1
-if (-not $n) { '未找到 Quectel 网卡'; exit 0 }
+$n = [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() |
+  Where-Object {
+    $_.Description -match 'Quectel|RMNET|MBIM|Generic Mobile Broadband|通用移动宽带|LTE Module' -or
+    $_.NetworkInterfaceType -match 'Wwan'
+  } |
+  Sort-Object { if ($_.OperationalStatus -eq 'Up') { 0 } else { 1 } } |
+  Select-Object -First 1
+if (-not $n) { '未找到 4G 模块网卡'; exit 0 }
 $props = $n.GetIPProperties()
 $ip = ($props.UnicastAddresses | Where-Object { $_.Address.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1).Address.IPAddressToString
 $gw = ($props.GatewayAddresses | Where-Object { $_.Address.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1).Address.IPAddressToString
-"网卡: $($n.Name) | 状态: $($n.OperationalStatus) | IPv4: $ip | 网关: $gw"
+"网卡: $($n.Name) ($($n.Description)) | 状态: $($n.OperationalStatus) | IPv4: $ip | 网关: $gw"
 "#;
     let out = run_powershell(script, &[])?;
     if !out.stdout.is_empty() {
@@ -278,7 +357,7 @@ $items = Get-NetAdapter -ErrorAction SilentlyContinue |
     $desc = [string]$_.InterfaceDescription
     $name = [string]$_.Name
     $metric = if ($ipMap.ContainsKey($idx)) { $ipMap[$idx] } else { 9999 }
-    $isModem = ($desc -match 'Quectel|RMNET|MBIM')
+    $isModem = ($desc -match 'Quectel|RMNET|MBIM|Generic Mobile Broadband|通用移动宽带|LTE Module' -or $name -match '蜂窝|Cellular')
     $tag = if ($isModem) {
       '模块网卡'
     } elseif ($name -match 'Wi-Fi|WLAN|无线' -or $desc -match 'Wi-Fi|WLAN|Wireless|802\.11') {

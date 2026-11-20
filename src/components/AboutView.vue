@@ -14,7 +14,7 @@
       <div class="hero-info">
         <div class="hero-title-row">
           <span class="about-title">EC20 Hub</span>
-          <span class="version-tag">v0.1.0</span>
+          <span class="version-tag">v0.1.1</span>
         </div>
         <div class="about-desc">
           Quectel EC20 / EC25 4G 模块 Windows 桌面管理工具，基于 Tauri v2 + Rust + Vue 3 构建。

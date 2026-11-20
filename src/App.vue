@@ -55,6 +55,7 @@ const dashboard = ref<DashboardPayload>({
 const messages = ref<SmsMessage[]>([]);
 let unlistenStatus: UnlistenFn | null = null;
 let unlistenSms: UnlistenFn | null = null;
+let unlistenNavigateSms: UnlistenFn | null = null;
 
 async function loadDashboard() {
   dashboard.value = await invoke<DashboardPayload>("get_dashboard_state");
@@ -93,11 +94,16 @@ onMounted(async () => {
   unlistenSms = await listen("sms-updated", () => {
     loadMessages();
   });
+  unlistenNavigateSms = await listen("navigate-sms", async () => {
+    activeTab.value = "sms";
+    await loadMessages();
+  });
 });
 
 onUnmounted(() => {
   unlistenStatus?.();
   unlistenSms?.();
+  unlistenNavigateSms?.();
 });
 </script>
 

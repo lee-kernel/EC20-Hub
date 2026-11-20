@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, onActivated, onMounted, ref } from "vue";
+import { computed, onActivated, onMounted, onUnmounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { Copy, RefreshCw, Send, Trash2, X } from "lucide-vue-next";
 import type { SmsMessage } from "../types";
 
@@ -81,8 +82,20 @@ async function markAllRead() {
   emit("mark-read");
 }
 
-onMounted(markAllRead);
+let unlistenNavigateSms: UnlistenFn | null = null;
+
+onMounted(async () => {
+  await markAllRead();
+  unlistenNavigateSms = await listen("navigate-sms", async () => {
+    selectedSender.value = null;
+    search.value = "";
+    await markAllRead();
+  });
+});
 onActivated(markAllRead);
+onUnmounted(() => {
+  unlistenNavigateSms?.();
+});
 
 function showTip(msg: string) {
   statusTip.value = msg;

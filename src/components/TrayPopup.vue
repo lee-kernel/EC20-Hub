@@ -62,6 +62,10 @@ async function openMain() {
   await invoke("open_main_window");
 }
 
+async function openSms() {
+  await invoke("open_sms_window");
+}
+
 onMounted(async () => {
   dashboard.value = await invoke<DashboardPayload>("get_dashboard_state");
   applyTheme(dashboard.value.settings.theme);
@@ -123,7 +127,12 @@ onUnmounted(() => {
         {{ dashboard.status.simInserted ? "SIM 已插入" : "无 SIM 卡" }}
       </span>
 
-      <span v-if="dashboard.unreadCount > 0" class="pill pill-red">
+      <span
+        v-if="dashboard.unreadCount > 0"
+        class="pill pill-red clickable"
+        title="点击查看新短信"
+        @click="openSms"
+      >
         未读短信 {{ dashboard.unreadCount }}
       </span>
 
@@ -250,6 +259,10 @@ onUnmounted(() => {
 .pill-red {
   background: var(--red-bg);
   color: var(--red);
+}
+
+.pill-red.clickable {
+  cursor: pointer;
 }
 
 .actions {

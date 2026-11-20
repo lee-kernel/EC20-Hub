@@ -45,19 +45,24 @@ fn register_windows_toast_aumid(data_dir: &std::path::Path) {
     }
 }
 
-fn send_sms_notification(_app: &AppHandle, title: &str, body: &str) {
+fn send_sms_notification(app: &AppHandle, title: &str, body: &str) {
     #[cfg(windows)]
     {
+        let app_handle = app.clone();
         let _ = tauri_winrt_notification::Toast::new(APP_AUMID)
             .title(title)
             .text1(body)
             .sound(Some(tauri_winrt_notification::Sound::Default))
+            .on_activated(move |_action| {
+                open_sms_page(&app_handle);
+                Ok(())
+            })
             .show();
     }
 
     #[cfg(not(windows))]
     {
-        let _ = _app
+        let _ = app
             .notification()
             .builder()
             .title(title)
@@ -113,6 +118,7 @@ fn sync_sms_with_modem(modem: &mut ModemClient, state: &AppState, app: &AppHandl
 
     modem.pending_cmti.clear();
     let mut collected_all = Vec::new();
+    let mut pending_deletes: Vec<(&'static str, Vec<u32>)> = Vec::new();
     for storage_name in ["SM", "ME"] {
         let raw_parts = modem.read_all_pdu_from(storage_name);
         if raw_parts.is_empty() {
@@ -124,8 +130,8 @@ fn sync_sms_with_modem(modem: &mut ModemClient, state: &AppState, app: &AppHandl
             indices_to_delete.extend(indices);
             collected_all.push(decoded);
         }
-        if takeover && !indices_to_delete.is_empty() {
-            modem.delete_sms_indices(storage_name, &indices_to_delete);
+        if !indices_to_delete.is_empty() {
+            pending_deletes.push((storage_name, indices_to_delete));
         }
     }
 
@@ -134,6 +140,7 @@ fn sync_sms_with_modem(modem: &mut ModemClient, state: &AppState, app: &AppHandl
     }
 
     let mut new_msgs = Vec::new();
+    let mut notifications = Vec::new();
     for decoded in collected_all {
         let duplicate = existing_messages.iter().any(|m| {
             m.direction == "in"
@@ -171,12 +178,12 @@ fn sync_sms_with_modem(modem: &mut ModemClient, state: &AppState, app: &AppHandl
                 decoded.text.clone()
             };
             let title = format!("新短信 · {}", decoded.sender);
-            send_sms_notification(app, &title, &body);
+            notifications.push((title, body));
         }
     }
 
     let added = new_msgs.len();
-    if added > 0 {
+    let saved_ok = if added > 0 {
         let updated_messages = {
             let mut snap = state.snapshot.write().unwrap();
             for m in new_msgs.into_iter().rev() {
@@ -184,9 +191,25 @@ fn sync_sms_with_modem(modem: &mut ModemClient, state: &AppState, app: &AppHandl
             }
             snap.messages.clone()
         };
-        state.store.lock().unwrap().save_messages(&updated_messages);
+        let res = state.store.lock().unwrap().save_messages(&updated_messages);
         let _ = app.emit("sms-updated", ());
+        res.is_ok()
+    } else {
+        // 读出的短信均已存在于本地归档中
+        !existing_messages.is_empty()
+    };
+
+    // 仅在本地归档落盘成功后再清理 SIM 卡与模块存储，避免落盘失败或中断导致短信彻底丢失
+    if takeover && saved_ok {
+        for (storage_name, indices) in &pending_deletes {
+            modem.delete_sms_indices(storage_name, indices);
+        }
     }
+
+    for (title, body) in notifications {
+        send_sms_notification(app, &title, &body);
+    }
+
     added
 }
 
@@ -203,14 +226,24 @@ fn get_messages(state: State<AppState>) -> Vec<SmsMessage> {
 
 #[tauri::command]
 fn mark_all_read(state: State<AppState>) {
-    let updated = {
+    let maybe_updated = {
         let mut snap = state.snapshot.write().unwrap();
+        let mut changed = false;
         for m in &mut snap.messages {
-            m.read = true;
+            if !m.read {
+                m.read = true;
+                changed = true;
+            }
         }
-        snap.messages.clone()
+        if changed {
+            Some(snap.messages.clone())
+        } else {
+            None
+        }
     };
-    state.store.lock().unwrap().save_messages(&updated);
+    if let Some(updated) = maybe_updated {
+        let _ = state.store.lock().unwrap().save_messages(&updated);
+    }
 }
 
 #[tauri::command]
@@ -220,7 +253,7 @@ fn delete_message(id: String, state: State<AppState>) -> Vec<SmsMessage> {
         snap.messages.retain(|m| m.id != id);
         snap.messages.clone()
     };
-    state.store.lock().unwrap().save_messages(&updated);
+    let _ = state.store.lock().unwrap().save_messages_allow_empty(&updated);
     updated
 }
 
@@ -230,7 +263,7 @@ fn clear_messages(state: State<AppState>) -> Vec<SmsMessage> {
         let mut snap = state.snapshot.write().unwrap();
         snap.messages.clear();
     }
-    state.store.lock().unwrap().save_messages(&[]);
+    let _ = state.store.lock().unwrap().save_messages_allow_empty(&[]);
     Vec::new()
 }
 
@@ -411,7 +444,7 @@ async fn send_sms(
             snap.messages.insert(0, msg.clone());
             snap.messages.clone()
         };
-        st.store.lock().unwrap().save_messages(&updated);
+        let _ = st.store.lock().unwrap().save_messages(&updated);
         let _ = app.emit("sms-updated", ());
         Ok(msg)
     })
@@ -532,6 +565,11 @@ fn open_main_window(app: AppHandle) {
     show_main_window(&app);
 }
 
+#[tauri::command]
+fn open_sms_window(app: AppHandle) {
+    open_sms_page(&app);
+}
+
 fn show_main_window(app: &AppHandle) {
     if let Some(popup) = app.get_webview_window("tray-popup") {
         let _ = popup.hide();
@@ -539,8 +577,15 @@ fn show_main_window(app: &AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
         let _ = win.unminimize();
         let _ = win.show();
+        let _ = win.set_always_on_top(true);
         let _ = win.set_focus();
+        let _ = win.set_always_on_top(false);
     }
+}
+
+fn open_sms_page(app: &AppHandle) {
+    show_main_window(app);
+    let _ = app.emit("navigate-sms", ());
 }
 
 const TRAY_POPUP_W: f64 = 380.0;
@@ -700,6 +745,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_dashboard_state,
             open_main_window,
+            open_sms_window,
             refresh_now,
             reboot_modem,
             update_settings,
